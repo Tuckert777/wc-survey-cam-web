@@ -173,6 +173,14 @@
     border-radius:10px; padding:12px; white-space:pre-wrap; word-break:break-word;
     max-height:52vh; overflow:auto; margin:0; }
 
+  .saveditem { display:flex; align-items:center; gap:10px; padding:10px 0;
+    border-bottom:1px solid var(--line); }
+  .saveditem .nm { flex:1; min-width:0; font-family:ui-monospace,Menlo,monospace;
+    font-size:12.5px; word-break:break-all; }
+  .saveditem .tm { font-size:11.5px; color:var(--muted); }
+  .saveditem button { width:auto; margin:0; padding:9px 14px; font-size:13.5px;
+    background:rgba(255,255,255,.06); border:1px solid var(--line); }
+
   .donebox { text-align:center; }
   .donebox .big { font-size:46px; color:var(--good); }
   .donebox .fn { font-family:ui-monospace,Menlo,monospace; font-size:14px;
@@ -207,6 +215,7 @@
       <button id="btnManual" class="primary">Set Manual Arrow</button>
       <button id="btnNoArrow" class="primary">No Arrow</button>
     </div>
+    <button id="btnShootSaved" class="ghost" style="margin-top:0">Saved photos</button>
   </section>
 
   <!-- ============ TAG SCREEN ============ -->
@@ -246,8 +255,8 @@
       </div>
       <label for="inDesc">Description (optional)</label>
       <input type="text" id="inDesc" autocomplete="off">
-      <button id="btnSaveShare" class="primary">Send</button>
-      <button id="btnSave" class="ghost">Save to camera roll instead</button>
+      <button id="btnSaveShare" class="primary">Save &amp; Send</button>
+      <button id="btnSave" class="ghost">Save to camera roll only</button>
       <div class="hint hide" id="iosHint">Choose <b>Save Image</b> in the share
         sheet for the camera roll, or pick Egnyte to send it.</div>
       <button id="btnChangeTarget" class="ghost hide">Change where it sends</button>
@@ -267,6 +276,18 @@
     </div>
   </section>
 
+  <!-- ============ SAVED PHOTOS ============ -->
+  <section id="scrSaved" class="hide">
+    <div class="card">
+      <h2>Saved photos</h2>
+      <div class="hint">Every photo is in the camera roll whether or not the send
+        worked. Check these against Egnyte before leaving the job, and re-send
+        anything missing.</div>
+      <div id="savedList"></div>
+      <button id="btnSavedBack" class="ghost">Back</button>
+    </div>
+  </section>
+
   <!-- ============ DONE SCREEN ============ -->
   <section id="scrDone" class="hide">
     <div class="card donebox">
@@ -275,6 +296,7 @@
       <div class="fn" id="doneName"></div>
       <div class="meta" id="doneWhere"></div>
       <button id="btnAnother" class="primary">Take another</button>
+      <button id="btnDoneSaved" class="ghost">Saved photos</button>
     </div>
   </section>
 
@@ -960,20 +982,34 @@ function doSave(toRoll){
   }
 
   busy(true);
-  // The two destinations are deliberately exclusive: sending already puts the
-  // frame where it needs to live, and a gallery copy of everything that went
-  // to Egnyte is just noise to scroll past later.
-  var job = toRoll
-    ? ps.saveToGallery({ filename: name, base64: b64 })
-        .then(function(){ return "Camera roll \u2192 Pictures / WC Survey Photos"; })
-    : ps.shareTo({ filename: name, base64: b64 })
-        .then(function(r){ return "Sent" + (r && r.label ? " to " + r.label : ""); });
 
-  job.then(function(where){ commitPt(pt); showDone(name, where); })
-     .catch(function(e){
-       toast((toRoll ? "Save" : "Send") + " failed: " + (e && e.message ? e.message : e));
-       busy(false);
-     });
+  // The camera roll copy is written FIRST and is never optional.
+  //
+  // A share sheet reports success the moment it opens, so the app cannot tell
+  // whether Egnyte actually took the file -- and Egnyte has been observed
+  // silently accepting photos and never uploading them. When sending was the
+  // only destination, that meant the photo was gone with nothing to recover.
+  // Now every frame lands in the gallery before anything else is attempted,
+  // and a failed gallery write aborts the send rather than risking a photo
+  // that exists nowhere.
+  ps.saveToGallery({ filename: name, base64: b64 })
+    .then(function(){
+      if (toRoll) return "Saved to camera roll";
+      return ps.shareTo({ filename: name, base64: b64 })
+        .then(function(r){
+          return "Saved to camera roll\nSent" + (r && r.label ? " to " + r.label : "") +
+                 " \u2014 confirm it arrived";
+        })
+        .catch(function(){
+          // the copy is safe, so this is recoverable, not a loss
+          return "Saved to camera roll\nSend failed \u2014 re-send from Saved photos";
+        });
+    })
+    .then(function(where){ commitPt(pt); showDone(name, where); })
+    .catch(function(e){
+      toast("Could not save to the camera roll: " + (e && e.message ? e.message : e));
+      busy(false);
+    });
 }
 
 function busy(on){
@@ -1070,12 +1106,13 @@ function showDone(name, whereText){
 $("btnAnother").onclick = resetToShoot;
 
 function resetToShoot(){
-  $("scrTag").classList.add("hide");
-  $("scrDone").classList.add("hide");
+  // hide every screen, not just the two this used to know about -- a new
+  // section that isn't listed here shows through on top of the shoot screen
+  hideAllScreens();
   $("scrShoot").classList.remove("hide");
   lock = null;
   var btn = $("btnLock");
-  btn.textContent = "Lock heading & take photo";
+  btn.textContent = "Lock Heading";
   btn.disabled = true;
   btn.onclick = lockHandler;
   $("btnManual").classList.remove("hide");
@@ -1206,12 +1243,94 @@ document.addEventListener("keydown", function(e){
   }
 });
 
+/* ---------------- saved photos ---------------- */
+/**
+ * The recovery screen. Reads the camera roll rather than any list the app
+ * keeps, so it shows what is genuinely on the phone -- not what the app
+ * believes it saved.
+ */
+function showSaved(){
+  var ps = native("PhotoSave");
+  hideAllScreens();
+  $("scrSaved").classList.remove("hide");
+  var list = $("savedList");
+  list.textContent = "Reading the camera roll\u2026";
+
+  if (!ps || !ps.listSaved){
+    list.textContent = "Only available in the installed app.";
+    return;
+  }
+  ps.listSaved({ limit: 60 }).then(function(r){
+    var items = (r && r.items) || [];
+    list.textContent = "";
+    if (!items.length){
+      list.textContent = "Nothing saved yet.";
+      return;
+    }
+    items.forEach(function(it){
+      var row = document.createElement("div");
+      row.className = "saveditem";
+
+      var left = document.createElement("div");
+      left.className = "nm";
+      left.textContent = it.name;
+      var when = document.createElement("div");
+      when.className = "tm";
+      when.textContent = fmtWhen(it.date);
+      left.appendChild(when);
+
+      var btn = document.createElement("button");
+      btn.textContent = "Re-send";
+      btn.onclick = function(){
+        btn.disabled = true;
+        ps.shareSaved({ uri: it.uri })
+          .then(function(){ btn.textContent = "Sent"; })
+          .catch(function(e){
+            btn.disabled = false;
+            toast("Re-send failed: " + (e && e.message ? e.message : e));
+          });
+      };
+
+      row.appendChild(left);
+      row.appendChild(btn);
+      list.appendChild(row);
+    });
+  }).catch(function(e){
+    list.textContent = "Could not read the camera roll: " +
+      (e && e.message ? e.message : e);
+  });
+}
+
+function fmtWhen(ms){
+  if (!ms) return "";
+  var d = new Date(ms), n = new Date();
+  var sameDay = d.toDateString() === n.toDateString();
+  var t = pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+  return sameDay ? ("today " + t)
+                 : (pad2(d.getMonth()+1) + "/" + pad2(d.getDate()) + " " + t);
+}
+
+function hideAllScreens(){
+  ["scrShoot","scrTag","scrDone","scrDiag","scrSaved"].forEach(function(id){
+    $(id).classList.add("hide");
+  });
+}
+
+$("btnShootSaved").onclick = showSaved;
+$("btnDoneSaved").onclick = showSaved;
+$("btnSavedBack").onclick = function(){
+  hideAllScreens();
+  $("scrShoot").classList.remove("hide");
+};
+
 /* ---------------- platform tidy-up ---------------- */
 (function(){
   if (native("PhotoSave")) return;   // installed app: nothing to change
   // In a browser both buttons land in the same share sheet, so presenting
   // them as two destinations would be a lie.
   $("btnSave").classList.add("hide");
+  $("btnShootSaved").classList.add("hide");
+  $("btnDoneSaved").classList.add("hide");
   $("btnSaveShare").textContent = "Save / Send";
   $("iosHint").classList.remove("hide");
   $("btnChangeTarget").classList.add("hide");
